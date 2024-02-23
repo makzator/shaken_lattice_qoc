@@ -52,24 +52,24 @@ function free_propagator(
     t::Float64,
     bloch_energies::Vector{Float64}
 )
-    U = QO.Operator(BlochBasisN(length(bloch_energies)), LA.diagm(exp.(-1im*bloch_energies*t)))
+    U = QO.Operator(BlochBasis(; N=length(bloch_energies)), LA.diagm(exp.(-1im*bloch_energies*t)))
     return U
 end
 
 function free_hamiltonian(
-    p_basis::QO.MomentumBasis,
+    p_basis::pBasis,
     V::Float64
 )
     w = get_w(p_basis)
     p = QO.momentum(p_basis)
     H_kin_p = p^2
-    H_pot_p = -V/4 * QO.Operator(p_basis, LA.diagm(w => ones(p_basis.N-w), -w => ones(p_basis.N-w)))
+    H_pot_p = -V/4 * QO.Operator(QO.MomentumBasis(p_basis), LA.diagm(w => ones(p_basis.N-w), -w => ones(p_basis.N-w)))
     H_p = H_kin_p + H_pot_p
     return H_p
 end
 
 function free_propagator_QO(
-    p_basis::QO.MomentumBasis,
+    p_basis::pBasis,
     ts::Vector{Float64},
     V::Float64
 )
@@ -77,51 +77,70 @@ function free_propagator_QO(
     _, Ut = QO.timeevolution.schroedinger(ts, collect(QO.identityoperator(p_basis)), H)
     return Ut
 end
-free_propagator_QO(p_basis::QO.MomentumBasis, t::Float64, V::Float64) = free_propagator_QO(p_basis, [0., t], V)[end]
+free_propagator_QO(p_basis::pBasis, t::Float64, V::Float64) = free_propagator_QO(p_basis, [0., t], V)[end]
 
 
-struct GateSeries
-    gates::Vector{QO.Operator}
-    # function GateSeries(gates::Vector{QO.Operator}=Vector{QO.Operator}[])
-    #     return new(gates)
-    # end
+abstract type AbstractCircuit end
+
+struct CircuitBlock <: AbstractCircuit
+    circ::AbstractCircuit
+    name::String
+end
+CircuitBlock(circ::AbstractCircuit) = CircuitBlock(circ, "CB")
+show_name_(block::CircuitBlock) = "[$(block.name)]"
+function Base.show(io::IO, block::CircuitBlock)
+    print(io, show_name_(block))
 end
 
-CircuitElement = Union{QO.Operator, GateSeries}
-struct Circuit
-    gates::Vector{CircuitElement}
-    function Circuit()
-        return new(CircuitElement[])
-    end
-    # function GateSeries(gates::T=T[]) where T=Vector{Union{QO.Operator, GateSeries}}
-    #     return new{gates}
-    # end
+CircuitElement = Union{Gate, CircuitBlock}
+struct Circuit <: AbstractCircuit
+    elements::Vector{CircuitElement}
 end
-Base.push!(circ::Circuit, element::CircuitElement) = push!(circ.gates, element)
-Base.append!(circ::Circuit, elements::Vector{<:QO.Operator}) = append!(circ.gates, elements)
-Base.append!(circ::Circuit, elements::GateSeries) = append!(circ.gates, elements.gates)
-Base.append!(circ::Circuit, element::CircuitElement) = push!(circ, element)
-function Base.append!(circ::Circuit, elements::Vector{CircuitElement})
-    for element in elements
-        append!(circ, element)
+Circuit() = Circuit(CircuitElement[])
+function Base.show(io::IO, circ::Circuit)
+    s = "|B=0>  - "
+    for el in circ.elements
+        s = s * show_name_(el) * " - "
     end
+    print(io, s)
 end
-function unroll(circ::Circuit)
-    new_circ = Circuit()
-    for el in circ.gates
-        if el isa GateSeries
-            append!(new_circ, el)
-        else
-            push!(new_circ, el)
-        end
-    end
-    return new_circ
-end
+
+Base.push!(circ::Circuit, element::CircuitElement) = push!(circ.elements, deepcopy(element))
+Base.append!(circ::Circuit, elements::Vector{<:CircuitElement}) = append!(circ.elements, deepcopy(elements))
+# Base.append!(circ::Circuit, block::CircuitBlock) = append!(circ.elements, elements.elements)
+# Base.append!(circ::Circuit, element::CircuitElement) = push!(circ, element)
+# function Base.append!(circ::Circuit, elements::Vector{CircuitElement})
+#     for element in elements
+#         append!(circ, element)
+#     end
+# end
 function concatenate(circs...)
     new_circ = Circuit()
     for circ in circs
         @assert circ isa Circuit
-        append!(new_circ, circ.gates)
+        append!(new_circ, circ.elements)
+    end
+    return new_circ
+end
+function unroll(circ::Circuit)
+    new_circ = Circuit()
+    for el in circ.elements
+        if el isa Gate
+            push!(new_circ, el)
+        else
+            append!(new_circ, el.circ.elements)
+        end
+    end
+    return new_circ
+end
+function unroll_full(circ::Circuit)
+    new_circ = Circuit()
+    for el in circ.elements
+        if el isa Gate
+            push!(new_circ, el)
+        else
+            append!(new_circ, unroll_full(el.circ).elements)
+        end
     end
     return new_circ
 end
