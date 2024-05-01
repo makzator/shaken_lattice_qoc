@@ -58,6 +58,9 @@ pBasis(n_basis::nBasis, w::Int) = pBasis(n_basis.n_max, w)
 pBasis(bloch_basis::BlochBasis, w::Int) = pBasis(nBasis(bloch_basis), w)
 
 
+SLBasis = Union{BlochBasis, nBasis, pBasis}
+
+
 transform_nB(bloch_states) = QO.Operator(
                                 nBasis(; N=size(bloch_states)[1]),
                                 BlochBasis(; N=size(bloch_states)[2]),
@@ -72,24 +75,38 @@ function coarse_setup(system::QC.QuantumSystem)
 end
 
 
-struct Gate
+abstract type AbstractGate end
+show_name_(gate::AbstractGate) = gate.name
+
+struct OpGate <: AbstractGate
     op::QO.Operator
     name::String 
+    t::Float64
 end
-function Gate(op::QO.Operator; name::String="U")
-    return Gate(op, name)
+function OpGate(op::QO.Operator; name::String="U", t::Float64=0.)
+    return OpGate(op, name, t)
 end
-function Gate(gate::Gate, new_op::QO.Operator)
-    fields = [getfield(gate, key) for key in fieldnames(Gate)]
+function OpGate(gate::OpGate, new_op::QO.Operator)
+    fields = [getfield(gate, key) for key in fieldnames(OpGate)]
     fields[1] = new_op
-    return Gate(fields...)
+    return OpGate(fields...)
 end
-show_name_(gate::Gate) = gate.name
-Base.:(==)(g1::Gate, g2::Gate) = all([getfield(g1, key) == getfield(g2, key) for key in fieldnames(Gate)])
+Base.:(==)(g1::OpGate, g2::OpGate) = all([getfield(g1, key) == getfield(g2, key) for key in fieldnames(OpGate)])
+
+
+struct ActionGate <: AbstractGate
+    action::Function
+    name::String
+    ts::Vector{Float64}
+end
+function ActionGate(action::Function; name::String="U", ts=Float64[])
+    return ActionGate(action, name, ts)
+end
+Base.:(==)(g1::ActionGate, g2::ActionGate) = all([getfield(g1, key) == getfield(g2, key) for key in fieldnames(ActionGate)])
 
 
 function op_to_same_basis_type(
-    out_basis::Union{BlochBasis, nBasis, pBasis},
+    out_basis::SLBasis,
     op::QO.Operator
 )   
     @assert op.basis_l == op.basis_r && typeof(op.basis_l) == typeof(out_basis)
@@ -128,13 +145,13 @@ function op_to_same_basis_type(
 end
 
 gate_to_same_basis_type(
-    out_basis::Union{BlochBasis, nBasis, pBasis},
-    gate::Gate
-) = Gate(gate, op_to_same_basis_type(out_basis, gate.op))
+    out_basis::SLBasis,
+    gate::OpGate
+) = OpGate(gate, op_to_same_basis_type(out_basis, gate.op))
 
 
 function op_to_basis(
-    out_basis::Union{BlochBasis, nBasis, pBasis},
+    out_basis::SLBasis,
     op::QO.Operator;
     TnB::Union{Nothing, QO.Operator}=nothing,
     sparse::Bool=false
@@ -156,7 +173,8 @@ function op_to_basis(
             end
         else
             # MomentumBasis
-            out_op = op_to_basis(nBasis(in_basis), op; TnB=TnB)
+            out_op = op_to_basis(nBasis(in_basis), op)
+            out_op = op_to_basis(BlochBasis(in_basis), out_op; TnB=TnB)
         end
     elseif out_basis isa nBasis
         if in_basis isa BlochBasis
@@ -194,8 +212,107 @@ function op_to_basis(
 end
 
 gate_to_basis(
-    out_basis::Union{BlochBasis, nBasis, pBasis},
-    gate::Gate;
+    out_basis::SLBasis,
+    gate::OpGate;
     TnB::Union{Nothing, QO.Operator}=nothing,
     sparse::Bool=false
-) = Gate(gate, op_to_basis(out_basis, gate.op; TnB=TnB, sparse=sparse))
+) = OpGate(gate, op_to_basis(out_basis, gate.op; TnB=TnB, sparse=sparse))
+
+
+function ket_to_same_basis_type(
+    out_basis::SLBasis,
+    ket::QO.Ket
+)   
+    in_basis = ket.basis
+    @assert typeof(in_basis) == typeof(out_basis)
+    T = eltype(ket.data)
+    if out_basis isa BlochBasis
+        if out_basis.N_pairs > in_basis.N_pairs
+            vec = zeros(T, out_basis.N)
+            vec[1:in_basis.N] = ket.data
+            out_ket = QO.Ket(out_basis, vec)
+        else
+            TBB = QO.Operator(out_basis, in_basis, Matrix{T}(LA.I, out_basis.N, in_basis.N))
+            out_ket = TBB * ket
+        end
+    elseif out_basis isa nBasis
+        if out_basis.n_max > in_basis.n_max
+            vec = zeros(T, out_basis)
+            in_mid = in_basis.N - in_basis.n_max
+            out_mid = out_basis.N - out_basis.n_max
+            idc = -in_basis.n_max:in_basis.n_max .+ out_mid
+            vec[idc] = ket.data
+            out_ket = QO.Ket(out_basis, vec)
+        else
+            d = in_basis.n_max - out_basis.n_max
+            TBB_mat = hcat(zeros(out_basis.N,d), Matrix{T}(LA.I, out_basis.N, out_basis.N), zeros(out_basis.N,d))
+            TBB = QO.Operator(out_basis, in_basis, TBB_mat)
+            out_ket = TBB * ket
+        end
+    else
+        # MomentumBasis -> nBasis -> MomentumBasis
+        ket_n_basis = ket_to_basis(nBasis(in_basis), ket)
+        ket_n_basis = ket_to_same_basis_type(nBasis(out_basis), ket_n_basis)
+        out_ket = ket_to_basis(out_basis, ket_n_basis)
+    end
+    return out_ket
+end
+
+function ket_to_basis(
+    out_basis::SLBasis,
+    ket::QO.Ket;
+    TnB::Union{Nothing, QO.Operator}=nothing,
+    sparse::Bool=false
+)
+    in_basis = ket.basis
+    if typeof(in_basis) == typeof(out_basis)
+        return ket_to_same_basis_type(out_basis, ket)
+    end
+    if out_basis isa BlochBasis
+        if in_basis isa nBasis
+            @assert !isnothing(TnB) && (TnB.basis_l == in_basis || TnB.basis_r == out_basis)
+            if TnB.basis_l == in_basis
+                out_ket = TnB' * ket
+                out_ket = ket_to_same_basis_type(out_basis, out_ket)
+            else
+                out_ket = ket_to_same_basis_type(TnB.basis_l, ket)
+                out_ket = TnB' * ket
+            end
+        else
+            # MomentumBasis
+            out_ket = ket_to_basis(nBasis(in_basis), ket)
+            out_ket = ket_to_basis(BlochBasis(in_basis), out_ket; TnB=TnB)
+        end
+    elseif out_basis isa nBasis
+        if in_basis isa BlochBasis
+            @assert !isnothing(TnB) && (TnB.basis_l == out_basis || TnB.basis_r == in_basis)
+            if TnB.basis_r == in_basis
+                out_ket = TnB * ket
+                out_ket = ket_to_same_basis_type(out_basis, out_ket)
+            else
+                out_ket = ket_to_same_basis_type(TnB.basis_r, ket)
+                out_ket = TnB * ket
+            end
+        else
+            # MomentumBasis
+            w = in_basis.w
+            in_n_basis = nBasis(in_basis)
+            idc = (0:(in_n_basis.N-1)) * w .+ div(w, 2)
+            out_ket = QO.Ket(in_n_basis, ket.data[idc]*sqrt(w))
+            out_ket = ket_to_same_basis_type(out_basis, out_ket)
+        end
+    else
+        # out_basis isa MomentumBasis
+        if in_basis isa BlochBasis
+            ket = ket_to_basis(nBasis(in_basis), ket; TnB=TnB)
+        end
+        # in_basis isa nBasis
+        out_ket = ket_to_same_basis_type(nBasis(out_basis), ket)
+        w = out_basis.w
+        out_ket = QO.Ket(out_basis, kron(out_ket.data, ones(eltype(out_ket.data), w)/sqrt(w)))
+    end
+    if sparse
+        out_ket = QO.sparse(out_ket)
+    end    
+    return out_ket
+end    
